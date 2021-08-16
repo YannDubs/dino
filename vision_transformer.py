@@ -21,6 +21,9 @@ from functools import partial
 import torch
 import torch.nn as nn
 
+import einops
+from compressai.entropy_models import EntropyBottleneck
+from compressai.models.utils import update_registered_buffers
 from utils import trunc_normal_
 
 
@@ -158,6 +161,11 @@ class VisionTransformer(nn.Module):
         # Classifier head
         self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
+        # FOR COMPRESSION
+        self.bottleneck = EntropyBottleneck(embed_dim, init_scale=10, filters=[3, 3, 3, 3])
+        self.scaling = torch.nn.Parameter(torch.ones(embed_dim) * 2)
+        self.biasing = torch.nn.Parameter(torch.zeros(embed_dim))
+
         trunc_normal_(self.pos_embed, std=.02)
         trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
@@ -211,7 +219,22 @@ class VisionTransformer(nn.Module):
         for blk in self.blocks:
             x = blk(x)
         x = self.norm(x)
-        return x[:, 0]
+        z = x[:, 0]
+
+        # ADDED TO PERFORM COMPRESSION
+        z = (z.float() + self.biasing) * self.scaling.exp()
+        z = einops.rearrange(z, "b (c e1 e2) -> b c e1 e2", e1=1, e2=1)
+        z_hat, q_z = self.bottleneck(z)
+        z_hat = einops.rearrange(z_hat, "b c e1 e2 -> b (c e1 e2)", e1=1, e2=1)
+        q_z = einops.rearrange(q_z, "b c e1 e2 -> b (c e1 e2)", e1=1, e2=1)
+        z_hat = (z_hat / self.scaling.exp()) - self.biasing
+
+        # H_q_z = E[- log q(z)]
+        rate = -torch.log(q_z).sum(-1).mean()
+
+        bottle_loss = self.bottleneck.loss()
+
+        return z_hat, rate, bottle_loss
 
     def get_last_selfattention(self, x):
         x = self.prepare_tokens(x)
@@ -232,6 +255,39 @@ class VisionTransformer(nn.Module):
                 output.append(self.norm(x))
         return output
 
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+
+        try:
+            # Dynamically update the entropy bottleneck buffers related to the CDFs
+            policy = "resize"  # resize when loading  (even if already called "update")
+            update_registered_buffers(
+                self.bottleneck,
+                f"{prefix}bottleneck",
+                ["_quantized_cdf", "_offset", "_cdf_length"],
+                state_dict,
+                policy=policy,
+            )
+        except:
+            pass
+
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
 def vit_tiny(patch_size=16, **kwargs):
     model = VisionTransformer(

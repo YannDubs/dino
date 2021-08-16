@@ -1,0 +1,6 @@
+*.out
+*.err
+log.txt
+output
+*.pyc
+data

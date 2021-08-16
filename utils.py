@@ -17,20 +17,20 @@ Misc functions.
 Mostly copy-paste from torchvision references or other public repos like DETR:
 https://github.com/facebookresearch/detr/blob/master/util/misc.py
 """
+import datetime
+import math
 import os
+import random
+import subprocess
 import sys
 import time
-import math
-import random
-import datetime
-import subprocess
 from collections import defaultdict, deque
 
 import numpy as np
 import torch
-from torch import nn
 import torch.distributed as dist
 from PIL import ImageFilter, ImageOps
+from torch import nn
 
 
 class GaussianBlur(object):
@@ -112,12 +112,13 @@ def load_pretrained_weights(model, pretrained_weights, checkpoint_key, model_nam
 def clip_gradients(model, clip):
     norms = []
     for name, p in model.named_parameters():
-        if p.grad is not None:
-            param_norm = p.grad.data.norm(2)
-            norms.append(param_norm.item())
-            clip_coef = clip / (param_norm + 1e-6)
-            if clip_coef < 1:
-                p.grad.data.mul_(clip_coef)
+        if not name.endswith(".quantiles"):
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                norms.append(param_norm.item())
+                clip_coef = clip / (param_norm + 1e-6)
+                if clip_coef < 1:
+                    p.grad.data.mul_(clip_coef)
     return norms
 
 
@@ -125,7 +126,16 @@ def cancel_gradients_last_layer(epoch, model, freeze_last_layer):
     if epoch >= freeze_last_layer:
         return
     for n, p in model.named_parameters():
-        if "last_layer" in n:
+        if "last_layer" in n and (not n.endswith(".quantiles")):
+            p.grad = None
+
+def cancel_gradients_dino(epoch, model, freeze_dino):
+    if epoch >= freeze_dino:
+        return
+    for n, p in model.named_parameters():
+        if (n.endswith(".quantiles")) or ("biasing" in n) or ("scaling" in n):
+            pass # only train the ones you added
+        else:
             p.grad = None
 
 
@@ -588,6 +598,9 @@ class MultiCropWrapper(nn.Module):
         self.head = head
 
     def forward(self, x):
+        rates = 0
+        bottle_losses = 0
+        i = 0 
         # convert to list
         if not isinstance(x, list):
             x = [x]
@@ -598,29 +611,42 @@ class MultiCropWrapper(nn.Module):
         start_idx, output = 0, torch.empty(0).to(x[0].device)
         for end_idx in idx_crops:
             _out = self.backbone(torch.cat(x[start_idx: end_idx]))
-            # The output is a tuple with XCiT model. See:
-            # https://github.com/facebookresearch/xcit/blob/master/xcit.py#L404-L405
             if isinstance(_out, tuple):
-                _out = _out[0]
+                _out, rate, bottle_loss = _out
+                bottle_losses = bottle_losses + bottle_loss
+                rates = rates + rate
+                i += 1
             # accumulate outputs
             output = torch.cat((output, _out))
             start_idx = end_idx
+
+        # add rates
+        if i > 0:
+            rates = rates / i
+            bottle_losses = bottle_losses / i
+
         # Run the head forward on the concatenated features.
-        return self.head(output)
+        return self.head(output), rates, bottle_losses
 
 
 def get_params_groups(model):
     regularized = []
     not_regularized = []
+    bottleneck = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        if name.endswith(".quantiles"):
+            bottleneck.append(param)
         # we do not regularize biases nor Norm parameters
-        if name.endswith(".bias") or len(param.shape) == 1:
+        elif name.endswith(".bias") or len(param.shape) == 1:
             not_regularized.append(param)
         else:
             regularized.append(param)
-    return [{'params': regularized}, {'params': not_regularized, 'weight_decay': 0.}]
+    return [{'params': regularized}, 
+    {'params': not_regularized, 'weight_decay': 0.},
+    {'params': bottleneck}, 
+    ]
 
 
 def has_batchnorms(model):

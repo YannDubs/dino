@@ -12,26 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import datetime
+import itertools
+import json
+import math
 import os
 import sys
-import datetime
 import time
-import math
-import json
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
 import torch
-import torch.nn as nn
-import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
+import torch.nn as nn
 import torch.nn.functional as F
-from torchvision import datasets, transforms
+from PIL import Image
+from torchvision import datasets
 from torchvision import models as torchvision_models
+from torchvision import transforms
 
 import utils
 import vision_transformer as vits
+from compressai.entropy_models import EntropyBottleneck
 from vision_transformer import DINOHead
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
@@ -40,6 +43,8 @@ torchvision_archs = sorted(name for name in torchvision_models.__dict__
 
 def get_args_parser():
     parser = argparse.ArgumentParser('DINO', add_help=False)
+
+    parser.add_argument('--beta', default=0.01, type=float, help="""Beta comrpession.""")
 
     # Model parameters
     parser.add_argument('--arch', default='vit_small', type=str,
@@ -93,6 +98,7 @@ def get_args_parser():
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
         during which we keep the output layer fixed. Typically doing so during
         the first epoch helps training. Try increasing this value if the loss does not decrease.""")
+    parser.add_argument('--freeze_dino', default=0, type=int, help=""".""")
     parser.add_argument("--lr", default=0.0005, type=float, help="""Learning rate at the end of
         linear warmup (highest LR used during training). The learning rate is linearly scaled
         with the batch size, and specified here for a reference batch size of 256.""")
@@ -128,6 +134,14 @@ def get_args_parser():
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
     return parser
 
+class CustomDataParallel(torch.nn.DataParallel):
+    """Custom DataParallel to access the module methods."""
+
+    def __getattr__(self, key):
+        try:
+            return super().__getattr__(key)
+        except AttributeError:
+            return getattr(self.module, key)
 
 def train_dino(args):
     utils.init_distributed_mode(args)
@@ -149,7 +163,7 @@ def train_dino(args):
         sampler=sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=True,
+        pin_memory=False,
         drop_last=True,
     )
     print(f"Data loaded: there are {len(dataset)} images.")
@@ -198,17 +212,18 @@ def train_dino(args):
         teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
 
         # we need DDP wrapper to have synchro batch norms working...
-        teacher = nn.parallel.DistributedDataParallel(teacher, device_ids=[args.gpu])
+        teacher = CustomDataParallel(teacher, device_ids=[args.gpu])
         teacher_without_ddp = teacher.module
     else:
         # teacher_without_ddp and teacher are the same thing
         teacher_without_ddp = teacher
-    student = nn.parallel.DistributedDataParallel(student, device_ids=[args.gpu])
+    student = CustomDataParallel(student, device_ids=[args.gpu])
     # teacher and student start with the same weights
     teacher_without_ddp.load_state_dict(student.module.state_dict())
     # there is no backpropagation through the teacher, so no need for gradients
-    for p in teacher.parameters():
-        p.requires_grad = False
+    for n,p in teacher.named_parameters():
+        if not n.endswith(".quantiles"): # not  bottleenck cause can have different sizes
+            p.requires_grad = False
     print(f"Student and Teacher are built: they are both {args.arch} network.")
 
     # ============ preparing loss ... ============
@@ -219,6 +234,7 @@ def train_dino(args):
         args.teacher_temp,
         args.warmup_teacher_temp_epochs,
         args.epochs,
+        beta=args.beta
     ).cuda()
 
     # ============ preparing optimizer ... ============
@@ -304,12 +320,21 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+
+        if it > 1e3:
+            break #DEV
+
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
             param_group["lr"] = lr_schedule[it]
+
+            #if i == 2: # don't cosine scehdule the bottleenck parameters
+            #    param_group["lr"] = 3e-4 * (0.93**epoch)
+                
             if i == 0:  # only the first group is regularized
                 param_group["weight_decay"] = wd_schedule[it]
+            
 
         # move images to gpu
         images = [im.cuda(non_blocking=True) for im in images]
@@ -317,7 +342,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
         with torch.cuda.amp.autocast(fp16_scaler is not None):
             teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
             student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            loss, ssl_loss, rates, bottle_losses = dino_loss(student_output, teacher_output, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -332,6 +357,8 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_norms = utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
                                               args.freeze_last_layer)
+            utils.cancel_gradients_dino(epoch, student,
+                                              args.freeze_dino)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
@@ -339,21 +366,28 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 fp16_scaler.unscale_(optimizer)  # unscale the gradients of optimizer's assigned params in-place
                 param_norms = utils.clip_gradients(student, args.clip_grad)
             utils.cancel_gradients_last_layer(epoch, student,
-                                              args.freeze_last_layer)
+                                              args.freeze_last_layer)   
+            utils.cancel_gradients_dino(epoch, student,
+                                              args.freeze_dino)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
         # EMA update for the teacher
         with torch.no_grad():
             m = momentum_schedule[it]  # momentum parameter
-            for param_q, param_k in zip(student.module.parameters(), teacher_without_ddp.parameters()):
-                param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
+            for (name, param_q),  param_k in zip(student.module.named_parameters(), teacher_without_ddp.parameters()):
+                if not name.endswith(".quantiles"): # don't EMA bottleneck cause different in both
+                    param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         # logging
         torch.cuda.synchronize()
         metric_logger.update(loss=loss.item())
+        metric_logger.update(ssl_loss=ssl_loss.item())
+        metric_logger.update(bottle_losses=(bottle_losses).item())
+        metric_logger.update(rates=(rates / math.log(2)).item())
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(wd=optimizer.param_groups[0]["weight_decay"])
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -363,7 +397,7 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
 class DINOLoss(nn.Module):
     def __init__(self, out_dim, ncrops, warmup_teacher_temp, teacher_temp,
                  warmup_teacher_temp_epochs, nepochs, student_temp=0.1,
-                 center_momentum=0.9):
+                 center_momentum=0.9, beta=0.1):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
@@ -376,11 +410,17 @@ class DINOLoss(nn.Module):
                         teacher_temp, warmup_teacher_temp_epochs),
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp
         ))
+        self.beta = beta
 
     def forward(self, student_output, teacher_output, epoch):
         """
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
+        student_output, st_rates, st_bottle_losses = student_output
+        teacher_output, t_rates, t_bottle_losses = teacher_output
+        rates = (st_rates + t_rates) / 2
+        bottle_losses = (st_bottle_losses + t_bottle_losses) / 2
+
         student_out = student_output / self.student_temp
         student_out = student_out.chunk(self.ncrops)
 
@@ -401,7 +441,9 @@ class DINOLoss(nn.Module):
                 n_loss_terms += 1
         total_loss /= n_loss_terms
         self.update_center(teacher_output)
-        return total_loss
+
+        loss = total_loss + self.beta * rates + bottle_losses
+        return loss, total_loss, rates, bottle_losses
 
     @torch.no_grad()
     def update_center(self, teacher_output):

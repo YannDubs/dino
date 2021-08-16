@@ -27,15 +27,13 @@ import submitit
 def parse_args():
     parser = argparse.ArgumentParser("Submitit for DINO", parents=[main_dino.get_args_parser()])
     parser.add_argument("--ngpus", default=8, type=int, help="Number of gpus to request on each node")
-    parser.add_argument("--nodes", default=2, type=int, help="Number of nodes to request")
-    parser.add_argument("--timeout", default=2800, type=int, help="Duration of the job")
+    parser.add_argument("--nodes", default=1, type=int, help="Number of nodes to request")
+    parser.add_argument("--timeout", default=10000, type=int, help="Duration of the job")
 
-    parser.add_argument("--partition", default="learnfair", type=str, help="Partition where to submit")
-    parser.add_argument("--use_volta32", action='store_true', help="Big models? Use this")
+    parser.add_argument("--partition", default="t4v2", type=str, help="Partition where to submit")
     parser.add_argument('--comment', default="", type=str,
                         help='Comment to pass to scheduler, e.g. priority message')
     return parser.parse_args()
-
 
 def get_shared_folder() -> Path:
     user = os.getenv("USER")
@@ -88,10 +86,8 @@ class Trainer(object):
 
 def main():
     args = parse_args()
-    if args.output_dir == "":
-        args.output_dir = get_shared_folder() / "%j"
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=30)
+    executor = submitit.AutoExecutor(folder=args.output_dir, slurm_max_num_timeout=150)
 
     num_gpus_per_node = args.ngpus
     nodes = args.nodes
@@ -99,21 +95,21 @@ def main():
 
     partition = args.partition
     kwargs = {}
-    if args.use_volta32:
-        kwargs['slurm_constraint'] = 'volta32gb'
     if args.comment:
         kwargs['slurm_comment'] = args.comment
 
     executor.update_parameters(
-        mem_gb=40 * num_gpus_per_node,
+        mem_gb=32,#20 * num_gpus_per_node,
         gpus_per_node=num_gpus_per_node,
         tasks_per_node=num_gpus_per_node,  # one task per GPU
-        cpus_per_task=10,
+        cpus_per_task=8,# 4,
         nodes=nodes,
         timeout_min=timeout_min,  # max is 60 * 72
         # Below are cluster dependent parameters
         slurm_partition=partition,
         slurm_signal_delay_s=120,
+        slurm_additional_parameters=dict(qos="normal"),
+        slurm_array_parallelism=30,
         **kwargs
     )
 
@@ -124,6 +120,7 @@ def main():
     trainer = Trainer(args)
     job = executor.submit(trainer)
 
+    print(f"Submitted job_id: {get_init_file()}")
     print(f"Submitted job_id: {job.job_id}")
     print(f"Logs and checkpoints will be saved at: {args.output_dir}")
 
